@@ -310,7 +310,7 @@ def _scan_with_progress(
         # Sort by port number
         return sorted(results, key=lambda x: x["port"])  # type: ignore
     else:
-        return sorted(open_ports)  # type: ignore
+        return sorted(results)  # type: ignore
 
 
 def _display_results(

@@ -419,3 +419,29 @@ def test_scan_command_verbose_logging(mock_scan_with_progress, mock_parse_ports,
     mock_setup_logging.assert_called_once()
     args, kwargs = mock_setup_logging.call_args
     assert args[0] is True  # verbose parameter should be True
+
+
+@patch('scanner.cli.main.validate_ip_address')
+@patch('scanner.cli.main.parse_ports')
+@patch('scanner.cli.main._scan_with_progress')
+def test_scan_command_normal_mode_open_port(mock_scan_with_progress, mock_parse_ports, mock_validate_ip):
+    """Test scan command in normal mode (no banner grab) with open port."""
+    # Setup mocks
+    mock_validate_ip.return_value = "127.0.0.1"
+    mock_parse_ports.return_value = [80]
+    mock_scan_with_progress.return_value = [80]  # Simulate port 80 open
+
+    result = runner.invoke(app, [
+        "scan",
+        "--host", "localhost",
+        "--ports", "80"
+    ])
+
+    assert result.exit_code == 0
+    # Verify the mocked function was called with correct parameters
+    mock_validate_ip.assert_called_once_with("localhost")
+    mock_parse_ports.assert_called_once_with("80")
+    mock_scan_with_progress.assert_called_once()
+    # Verify that open port is displayed in output
+    assert "80" in result.stdout
+    assert "HTTP" in result.stdout  # Service detection for port 80
