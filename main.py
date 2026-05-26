@@ -1,4 +1,13 @@
-from src.scanner.port_scanner import main
+"""
+Entry point for the TCP port scanner application.
+"""
+import sys
+from scanner.cli.main import app
 
 if __name__ == "__main__":
-    main()
+    # Handle potential encoding issues on Windows
+    if sys.platform.startswith('win'):
+        import os
+        os.system('')
+
+    app()
