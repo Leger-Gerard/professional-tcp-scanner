@@ -6,7 +6,7 @@ import logging
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import typer
 from rich.console import Console
@@ -20,8 +20,10 @@ from scanner.core.scanner import (
     scan_ports,
     validate_ip_address,
     parse_ports,
-    scan_tcp_port
+    scan_tcp_port,
+    scan_tcp_port_with_banner
 )
+from scanner.services.service_detector import get_service_name
 
 # Initialize console and app
 console = Console()
@@ -86,6 +88,12 @@ def scan(
         "-j",
         help="Output results in JSON format"
     ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Output file path for JSON report (requires --json-output)"
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -102,6 +110,12 @@ def scan(
         True,
         "--banner/--no-banner",
         help="Show or hide banner"
+    ),
+    banner_grab: bool = typer.Option(
+        False,
+        "--banner-grab",
+        "-b",
+        help="Attempt to grab service banners from open ports"
     )
 ) -> None:
     """
@@ -120,6 +134,9 @@ def scan(
 
     # Stealth scan for security assessments
     port-scanner scan --host target.com --stealth --threads 50
+
+    # Scan with banner grabbing for service fingerprinting
+    port-scanner scan --host target.com --ports 80,443,22 --banner-grab
     """
     # Adjust timing for stealth mode
     if stealth:
@@ -171,13 +188,14 @@ def scan(
             )
 
             # Custom scan function with progress updates
-            open_ports = _scan_with_progress(
+            scan_results = _scan_with_progress(
                 validated_host,
                 port_list,
                 timeout,
                 threads,
                 progress,
-                task
+                task,
+                grab_banner=banner_grab
             )
 
         end_time = datetime.now()
@@ -186,14 +204,17 @@ def scan(
         # Display results
         _display_results(
             validated_host,
-            open_ports,
+            scan_results,
             scan_duration,
             json_output,
-            len(port_list)
+            len(port_list),
+            output,
+            banner_grab=banner_grab
         )
 
         # Log results
-        logger.info(f"Scan completed: {len(open_ports)} open ports found in {scan_duration:.2f}s")
+        open_ports_count = len(scan_results) if isinstance(scan_results, list) else 0
+        logger.info(f"Scan completed: {open_ports_count} open ports found in {scan_duration:.2f}s")
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Scan interrupted by user[/yellow]")
@@ -210,8 +231,9 @@ def _scan_with_progress(
     timeout: float,
     max_threads: int,
     progress: Progress,
-    task_id
-) -> List[int]:
+    task_id,
+    grab_banner: bool = False
+) -> Union[List[int], List[dict]]:
     """
     Scan ports with progress bar updates.
 
@@ -222,22 +244,32 @@ def _scan_with_progress(
         max_threads: Max concurrent threads
         progress: Rich progress instance
         task_id: Progress task ID
+        grab_banner: Whether to attempt banner grabbing
 
     Returns:
-        List of open ports
+        If grab_banner=False: List[int] (open ports)
+        If grab_banner=True: List[dict] with keys: port, status, service, banner
     """
     if not ports:
-        return []
+        return [] if not grab_banner else []
 
-    open_ports: List[int] = []
+    # Import service detector for service names
+    from scanner.services.service_detector import get_service_name
 
     # Use ThreadPoolExecutor for controlled concurrency
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    results: Union[List[int], List[dict]] = []
+
     with ThreadPoolExecutor(max_workers=min(max_threads, len(ports))) as executor:
         # Submit all scan tasks
         future_to_port = {
-            executor.submit(scan_tcp_port, host, port, timeout): port
+            executor.submit(
+                scan_tcp_port_with_banner if grab_banner else scan_tcp_port,
+                host,
+                port,
+                timeout
+            ): port
             for port in ports
         }
 
@@ -245,72 +277,162 @@ def _scan_with_progress(
         for future in as_completed(future_to_port):
             port = future_to_port[future]
             try:
-                if future.result():
-                    open_ports.append(port)
-                    logger = logging.getLogger(__name__)
-                    logger.debug(f"Port {port} is OPEN on {host}")
+                result = future.result()
+                if grab_banner:
+                    is_open, banner = result
+                    if is_open:
+                        service = get_service_name(port)
+                        # For consistency with the JSON output, we'll return a dict
+                        # that matches what scan_ports_with_banner returns
+                        results.append({
+                            "port": port,
+                            "status": "open",
+                            "service": service or "unknown",
+                            "banner": banner or ""
+                        })
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"Port {port} is OPEN on {host} - Service: {service or 'unknown'}")
+                    else:
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"Port {port} is CLOSED on {host}")
+                else:
+                    if result:  # port is open
+                        results.append(port)  # type: ignore
+                        logger = logging.getLogger(__name__)
+                        logger.debug(f"Port {port} is OPEN on {host}")
             except Exception as e:
                 logger = logging.getLogger(__name__)
                 logger.error(f"Error scanning port {port}: {e}")
             finally:
                 progress.update(task_id, advance=1)
 
-    return sorted(open_ports)
+    if grab_banner:
+        # Sort by port number
+        return sorted(results, key=lambda x: x["port"])  # type: ignore
+    else:
+        return sorted(open_ports)  # type: ignore
 
 
 def _display_results(
     host: str,
-    open_ports: List[int],
+    scan_results: Union[List[int], List[dict]],
     duration: float,
     json_output: bool,
-    total_ports: int
+    total_ports: int,
+    output: Optional[Path] = None,
+    banner_grab: bool = False
 ) -> None:
     """
     Display scan results.
 
     Args:
         host: Target host
-        open_ports: List of open ports
+        scan_results: Either List[int] (open ports) or List[dict] (with service/banner info)
         duration: Scan duration in seconds
         json_output: Whether to output JSON
         total_ports: Total number of ports scanned
+        output: Optional file path to write JSON report
+        banner_grab: Whether banner grabbing was performed
     """
     if json_output:
         # JSON output
-        result = {
-            "target": host,
-            "timestamp": datetime.now().isoformat(),
-            "scan_duration_seconds": round(duration, 2),
-            "total_ports_scanned": total_ports,
-            "open_ports": open_ports,
-            "open_ports_count": len(open_ports)
-        }
-        console.print(json.dumps(result, indent=2))
+        if banner_grab and isinstance(scan_results, list) and len(scan_results) > 0 and isinstance(scan_results[0], dict):
+            # Banner grabbing results format
+            result = {
+                "target": host,
+                "timestamp": datetime.now().isoformat(),
+                "scan_duration_seconds": round(duration, 2),
+                "total_ports_scanned": total_ports,
+                "open_ports": scan_results,
+                "open_ports_count": len(scan_results),
+                "banner_grab_enabled": True
+            }
+        else:
+            # Standard format
+            ports_with_services = []
+            for port in scan_results:  # type: ignore
+                ports_with_services.append({
+                    "port": port,
+                    "service": get_service_name(port) or "unknown"
+                })
+
+            result = {
+                "target": host,
+                "timestamp": datetime.now().isoformat(),
+                "scan_duration_seconds": round(duration, 2),
+                "total_ports_scanned": total_ports,
+                "open_ports": ports_with_services,
+                "open_ports_count": len(ports_with_services),
+                "banner_grab_enabled": banner_grab
+            }
+        json_str = json.dumps(result, indent=2)
+        if output:
+            # Ensure output directory exists
+            output.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                output.write_text(json_str)
+                logger = logging.getLogger(__name__)
+                logger.info(f"JSON report written to {output}")
+            except Exception as e:
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to write JSON report to {output}: {e}")
+                console.print(f"[bold red]Error:[/bold red] Failed to write JSON report: {e}")
+                raise typer.Exit(1)
+        else:
+            console.print(json_str)
     else:
         # Rich formatted output
         console.print()
 
-        if open_ports:
-            # Create results table
-            table = Table(title=f"Open Ports on {host}")
-            table.add_column("Port", style="cyan", no_wrap=True)
-            table.add_column("Status", style="green")
-            table.add_column("Service", style="yellow")
+        if banner_grab and isinstance(scan_results, list) and len(scan_results) > 0 and isinstance(scan_results[0], dict):
+            # Banner grabbing results format
+            if scan_results:
+                # Create results table
+                table = Table(title=f"Open Ports on {host}")
+                table.add_column("Port", style="cyan", no_wrap=True)
+                table.add_column("Status", style="green")
+                table.add_column("Service", style="yellow")
+                table.add_column("Banner", style="dim", max_width=40)
 
-            for port in open_ports:
-                service = _get_common_service_name(port)
-                table.add_row(str(port), "OPEN", service)
+                for port_info in scan_results:
+                    banner_display = port_info["banner"][:50] + "..." if len(port_info["banner"]) > 50 else port_info["banner"]
+                    if not banner_display:
+                        banner_display = "[no banner]"
+                    table.add_row(
+                        str(port_info["port"]),
+                        port_info["status"],
+                        port_info["service"],
+                        banner_display
+                    )
 
-            console.print(table)
+                console.print(table)
+            else:
+                console.print(f"[yellow]No open ports found on {host}[/yellow]")
         else:
-            console.print(f"[yellow]No open ports found on {host}[/yellow]")
+            # Standard format
+            open_ports = scan_results if isinstance(scan_results, list) else []
+            if open_ports:
+                # Create results table
+                table = Table(title=f"Open Ports on {host}")
+                table.add_column("Port", style="cyan", no_wrap=True)
+                table.add_column("Status", style="green")
+                table.add_column("Service", style="yellow")
+
+                for port in open_ports:
+                    service = get_service_name(port)
+                    table.add_row(str(port), "OPEN", service)
+
+                console.print(table)
+            else:
+                console.print(f"[yellow]No open ports found on {host}[/yellow]")
 
         # Summary panel
+        open_ports_count = len(scan_results) if isinstance(scan_results, list) else 0
         summary_text = (
             f"Target: {host}\n"
             f"Duration: {duration:.2f} seconds\n"
             f"Ports Scanned: {total_ports}\n"
-            f"Open Ports Found: {len(open_ports)}"
+            f"Open Ports Found: {open_ports_count}"
         )
 
         panel = Panel(
@@ -321,24 +443,6 @@ def _display_results(
         console.print(panel)
 
 
-def _get_common_service_name(port: int) -> str:
-    """
-    Get common service name for well-known ports.
-
-    Args:
-        port: Port number
-
-    Returns:
-        Service name or empty string
-    """
-    common_services = {
-        20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "Telnet",
-        25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3",
-        143: "IMAP", 443: "HTTPS", 993: "IMAPS", 995: "POP3S",
-        3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL",
-        5900: "VNC", 8080: "HTTP-Proxy", 8443: "HTTPS-Alt"
-    }
-    return common_services.get(port, "")
 
 
 def show_banner() -> None:

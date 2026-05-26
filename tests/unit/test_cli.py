@@ -86,10 +86,91 @@ def test_scan_command_json_output(mock_scan_with_progress, mock_parse_ports, moc
     try:
         data = json.loads(json_str)
         assert data["target"] == "127.0.0.1"
-        assert data["open_ports"] == [80]
+        assert data["open_ports"] == [{"port": 80, "service": "HTTP"}]
         assert data["open_ports_count"] == 1
     except json.JSONDecodeError as e:
         pytest.fail(f"Output is not valid JSON: {json_str}. Error: {e}")
+
+
+@patch('scanner.cli.main.validate_ip_address')
+@patch('scanner.cli.main.parse_ports')
+@patch('scanner.cli.main._scan_with_progress')
+def test_scan_command_json_output_to_file(mock_scan_with_progress, mock_parse_ports, mock_validate_ip, tmp_path):
+    """Test scan command with JSON output to file."""
+    # Setup mocks
+    mock_validate_ip.return_value = "127.0.0.1"
+    mock_parse_ports.return_value = [80]
+    mock_scan_with_progress.return_value = [80]
+
+    output_file = tmp_path / "scan.json"
+
+    result = runner.invoke(app, [
+        "scan",
+        "--host", "localhost",
+        "--ports", "80",
+        "--json-output",
+        "--output", str(output_file)
+    ])
+
+    assert result.exit_code == 0
+    # Check that file was created and contains valid JSON
+    assert output_file.exists()
+    json_content = output_file.read_text()
+    data = json.loads(json_content)
+    assert data["target"] == "127.0.0.1"
+    assert data["open_ports"] == [{"port": 80, "service": "HTTP"}]
+    assert data["open_ports_count"] == 1
+
+
+@patch('scanner.cli.main.validate_ip_address')
+@patch('scanner.cli.main.parse_ports')
+@patch('scanner.cli.main._scan_with_progress')
+def test_scan_command_json_output_without_json_flag(mock_scan_with_progress, mock_parse_ports, mock_validate_ip, tmp_path):
+    """Test that --output without --json-output is ignored or handled appropriately."""
+    # Setup mocks
+    mock_validate_ip.return_value = "127.0.0.1"
+    mock_parse_ports.return_value = [80]
+    mock_scan_with_progress.return_value = [80]
+
+    output_file = tmp_path / "scan.json"
+
+    result = runner.invoke(app, [
+        "scan",
+        "--host", "localhost",
+        "--ports", "80",
+        "--output", str(output_file)
+    ])
+
+    # Should succeed but not create JSON file since --json-output not specified
+    assert result.exit_code == 0
+    # File should not be created since we didn't specify --json-output
+    assert not output_file.exists()
+
+
+@patch('scanner.cli.main.validate_ip_address')
+@patch('scanner.cli.main.parse_ports')
+@patch('scanner.cli.main._scan_with_progress')
+@patch('pathlib.Path.write_text')
+def test_scan_command_json_output_permission_error(mock_write_text, mock_scan_with_progress, mock_parse_ports, mock_validate_ip):
+    """Test scan command handles permission errors when writing JSON output."""
+    # Setup mocks
+    mock_validate_ip.return_value = "127.0.0.1"
+    mock_parse_ports.return_value = [80]
+    mock_scan_with_progress.return_value = [80]
+    mock_write_text.side_effect = PermissionError("Permission denied")
+
+    result = runner.invoke(app, [
+        "scan",
+        "--host", "localhost",
+        "--ports", "80",
+        "--json-output",
+        "--output", "/protected/system/file.json"
+    ])
+
+    # Should fail due to permission error
+    assert result.exit_code == 1
+    assert "Error:" in result.stdout
+    assert "Failed to write JSON report" in result.stdout
 
 
 @patch('scanner.cli.main.validate_ip_address')
