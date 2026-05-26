@@ -7,7 +7,9 @@ A professional TCP port scanner built with Python Typer and Rich for security as
 - 🔍 **Professional CLI**: Built with Typer for intuitive command-line interface
 - 🎨 **Rich Output**: Beautiful, colorful terminal output with progress bars and tables
 - ⚡ **Concurrent Scanning**: Multi-threaded scanning with configurable thread pools
-- 📊 **Multiple Output Formats**: Human-readable tables and JSON export
+- 📊 **Multiple Output Formats**: Human-readable tables and JSON export with flexible file output
+- 🔍 **Enhanced Service Detection**: Identifies services based on well-known port numbers
+- 💾 **Professional Report Export**: Export JSON reports to custom paths with automatic directory creation
 - 🛡️ **Security Focused**: Input validation, stealth mode, and proper error handling
 - 📝 **Professional Logging**: Rotating logs with different verbosity levels
 - 🧪 **Well Tested**: Comprehensive unit tests with >80% code coverage
@@ -52,6 +54,9 @@ port-scanner scan --host target.com --ports 80,443 --timeout 2.0 --threads 50
 # Enable JSON output for integration with other tools
 port-scanner scan --host target.com --json-output --output results.json
 
+# JSON output with auto-generated filename in reports/ directory
+port-scanner scan --host target.com --json-output
+
 # Use stealth mode for security assessments (slower, less detectable)
 port-scanner scan --host target.com --stealth --threads 30
 
@@ -76,6 +81,9 @@ port-scanner scan --host 192.168.1.100 --ports 1-65535 --json-output --output fu
 
 # Stealth scan for red team operations
 port-scanner scan --host target.internal --stealth --threads 20 --timeout 5.0
+
+# Scan with service detection (shows service names in output)
+port-scanner scan --host 127.0.0.1 --ports 22,80,443,3306
 ```
 
 ## Architecture
