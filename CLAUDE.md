@@ -1,38 +1,34 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance for coding agents working in this repository.
 
 ## Development Commands
 
-- **Run tests**: `python -m pytest`
-- **Run tests with coverage**: `python -m pytest --cov=src --cov-report=term-missing`
-- **Lint code**: `ruff check src` (ruff is in dev dependencies)
-- **Format code**: `ruff check --fix src`
-- **Type checking**: `mypy src`
-- **Run the port scanner**: `python main.py` (will prompt for input)
+- Run tests: `uv run --extra dev python -m pytest`
+- Run tests with coverage: `uv run --extra dev python -m pytest --cov=src --cov-report=term-missing`
+- Lint: `uv run --extra dev ruff check src tests`
+- Type check: `uv run --extra dev mypy src`
+- Run the CLI: `uv run port-scanner scan --host 127.0.0.1 --ports 80,443`
+
+If the local `.venv` is broken, use a project-local uv environment:
+
+```powershell
+$env:UV_CACHE_DIR='D:\TP_CYBER\.uv-cache'
+$env:UV_PYTHON_INSTALL_DIR='D:\TP_CYBER\.uv-python'
+$env:UV_PROJECT_ENVIRONMENT='D:\TP_CYBER\.uv-venv'
+uv run --extra dev python -m pytest
+```
 
 ## Project Structure
 
-- `main.py`: Entry point that calls the scanner's main function.
-- `src/scanner/port_scanner.py`: Contains the port scanning logic:
-  - `scan_port(host: str, port: int, timeout: float) -> bool`: Checks if a TCP port is open.
-  - `main() -> None`: Interactive CLI that scans a range of ports and reports results.
-- `tests/`: Unit tests for the scanner using pytest and mocking.
-- `pyproject.toml`: Project configuration with dependencies (requests, rich, typer) and dev dependencies (mypy, pytest, ruff).
+- `main.py`: simple application entry point.
+- `src/scanner/cli/main.py`: Typer/Rich command-line interface.
+- `src/scanner/core/scanner.py`: host, port, timeout, thread validation plus TCP scanning and banner grabbing.
+- `src/scanner/services/service_detector.py`: static port-to-service mapping.
+- `tests/unit/`: unit tests using mocks for network behavior.
 
-## Architecture Overview
+## Architecture Notes
 
-The port scanner is a simple TCP scanner that:
-1. Takes user input for target host and port range.
-2. For each port in the range, attempts a TCP connection with a short timeout.
-3. Reports which ports are open (connection successful) and which are closed/filtered.
-4. Measures and displays the total scan time.
+The scanner performs TCP connect scans with bounded timeouts and thread pools. Network connections go through `scanner.core.scanner._connect`, which uses `socket.create_connection` so IPv4 and IPv6 targets are both supported. Tests should mock `_connect` rather than low-level socket constructors.
 
-The scanner uses the standard library `socket` module and does not require external dependencies for core functionality.
-
-## Testing Approach
-
-Tests use mocking to simulate network interactions:
-- `socket.socket` is mocked to control the return value of `connect_ex`.
-- Tests cover open ports, closed ports, and timeout scenarios.
-- The main function is tested by mocking `input` and `scan_port` to verify output.
+The CLI supports human-readable output and JSON reports. JSON mode suppresses normal console logging unless verbose mode is enabled so stdout remains machine-readable.

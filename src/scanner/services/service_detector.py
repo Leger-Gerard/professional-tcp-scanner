@@ -78,7 +78,6 @@ class ServiceDetector:
 
             # Remote Access
             3389: "RDP",
-            5900: "VNC",
             5901: "VNC-1",
             5902: "VNC-2",
 
@@ -99,17 +98,13 @@ class ServiceDetector:
             5223: "XMPP-SSL",
 
             # Monitoring & Management
-            161: "SNMP",
-            162: "SNMP-Trap",
             514: "Syslog",
-            123: "NTP",
             8890: "HTTPS-Proxy-Admin",
 
             # Gaming
             25565: "Minecraft",
             27015: "Source-Engine",
             27016: "Source-Engine",
-            27017: "Source-Engine",
             27018: "Source-Engine",
             27019: "Source-Engine",
             27020: "Source-Engine",

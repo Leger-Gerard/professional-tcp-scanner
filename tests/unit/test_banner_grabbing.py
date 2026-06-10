@@ -4,8 +4,6 @@ Unit tests for banner grabbing functionality.
 import socket
 from unittest.mock import Mock, patch
 
-import pytest
-
 from scanner.core.scanner import (
     _grab_banner,
     scan_tcp_port,
@@ -55,9 +53,9 @@ def test_grab_banner_http_probe():
         mock_socket_class.return_value.__enter__.return_value = mock_socket_instance
         mock_socket_instance.recv.return_value = b""
 
-        result = _grab_banner(mock_socket_instance, 80, 1.0)
-        # Check that send was called for HTTP probe
-        mock_socket_instance.send.assert_called()
+    _ = _grab_banner(mock_socket_instance, 80, 1.0)
+    # Check that send was called for HTTP probe
+    mock_socket_instance.sendall.assert_called()
 
 
 def test_grab_banner_length_limit():
@@ -81,8 +79,8 @@ def test_scan_tcp_port_with_banner_closed_port(mock_parse_ports, mock_validate_i
     mock_validate_ip.return_value = "127.0.0.1"
     mock_parse_ports.return_value = [80]
 
-    with patch('scanner.core.scanner.scan_tcp_port') as mock_scan:
-        mock_scan.return_value = False  # Port closed
+    with patch('scanner.core.scanner._connect') as mock_connect:
+        mock_connect.side_effect = ConnectionRefusedError("Connection refused")
 
         is_open, banner = scan_tcp_port_with_banner("127.0.0.1", 80, 0.5)
 
@@ -97,10 +95,9 @@ def test_scan_tcp_port_with_banner_open_port_no_banner(mock_parse_ports, mock_va
     mock_validate_ip.return_value = "127.0.0.1"
     mock_parse_ports.return_value = [80]
 
-    with patch('scanner.core.scanner.socket.socket') as mock_socket_class:
+    with patch('scanner.core.scanner._connect') as mock_connect:
         mock_socket_instance = Mock()
-        mock_socket_class.return_value.__enter__.return_value = mock_socket_instance
-        mock_socket_instance.connect_ex.return_value = 0  # Connection successful
+        mock_connect.return_value.__enter__.return_value = mock_socket_instance
         mock_socket_instance.recv.return_value = b""  # No banner data
 
         is_open, banner = scan_tcp_port_with_banner("127.0.0.1", 80, 0.5)
@@ -116,10 +113,9 @@ def test_scan_tcp_port_with_banner_open_port_with_banner(mock_parse_ports, mock_
     mock_validate_ip.return_value = "127.0.0.1"
     mock_parse_ports.return_value = [80]
 
-    with patch('scanner.core.scanner.socket.socket') as mock_socket_class:
+    with patch('scanner.core.scanner._connect') as mock_connect:
         mock_socket_instance = Mock()
-        mock_socket_class.return_value.__enter__.return_value = mock_socket_instance
-        mock_socket_instance.connect_ex.return_value = 0  # Connection successful
+        mock_connect.return_value.__enter__.return_value = mock_socket_instance
         mock_socket_instance.recv.side_effect = [b"HTTP/1.1 200 OK\r\n", b""]  # Banner then timeout
 
         is_open, banner = scan_tcp_port_with_banner("127.0.0.1", 80, 0.5)
@@ -135,10 +131,8 @@ def test_scan_tcp_port_still_works(mock_parse_ports, mock_validate_ip):
     mock_validate_ip.return_value = "127.0.0.1"
     mock_parse_ports.return_value = [80]
 
-    with patch('scanner.core.scanner.socket.socket') as mock_socket_class:
-        mock_socket_instance = Mock()
-        mock_socket_class.return_value.__enter__.return_value = mock_socket_instance
-        mock_socket_instance.connect_ex.return_value = 0  # Port open
+    with patch('scanner.core.scanner._connect') as mock_connect:
+        mock_connect.return_value.__enter__.return_value = Mock()
 
         result = scan_tcp_port("127.0.0.1", 80, 0.5)
 

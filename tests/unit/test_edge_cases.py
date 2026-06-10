@@ -1,16 +1,16 @@
 """
 Edge case tests to improve coverage.
 """
-import ipaddress
 import socket
 from unittest.mock import patch, MagicMock
+
 import pytest
 
 from scanner.core.scanner import (
+    parse_ports,
+    scan_ports,
     scan_tcp_port,
     validate_ip_address,
-    parse_ports,
-    scan_ports
 )
 from scanner.cli.main import app
 from typer.testing import CliRunner
@@ -53,9 +53,15 @@ def test_validate_ip_address_edge_cases():
     with pytest.raises(ValueError, match="Invalid hostname"):
         validate_ip_address(long_host)
 
-    # Test valid hostname at exactly 255 chars
+    # Test invalid hostname with a single label longer than RFC 1035 permits.
     valid_long_host = "a" * 255
-    assert validate_ip_address(valid_long_host) == valid_long_host
+    with pytest.raises(ValueError, match="Invalid hostname"):
+        validate_ip_address(valid_long_host)
+
+    # Test valid hostname at exactly 255 chars with each label <= 63 chars.
+    valid_255_char_host = ".".join(["a" * 63, "b" * 63, "c" * 63, "d" * 61])
+    assert len(valid_255_char_host) == 253
+    assert validate_ip_address(valid_255_char_host) == valid_255_char_host
 
 
 def test_parse_ports_edge_cases():
@@ -119,47 +125,45 @@ def test_parse_ports_edge_cases():
         parse_ports("80,,443")  # Double comma
 
 
-@patch('socket.socket')
-def test_scan_tcp_port_exceptions(mock_socket):
+@patch('scanner.core.scanner._connect')
+def test_scan_tcp_port_exceptions(mock_connect):
     """Test exception handling in scan_tcp_port."""
     # Test socket.gaierror (DNS resolution failure)
-    mock_socket.side_effect = socket.gaierror("Name or service not known")
+    mock_connect.side_effect = socket.gaierror("Name or service not known")
     result = scan_tcp_port("invalidhostname", 80)
     assert result is False
 
     # Test socket.error (generic socket error)
-    mock_socket.side_effect = socket.error("Network error")
+    mock_connect.side_effect = socket.error("Network error")
     result = scan_tcp_port("127.0.0.1", 80)
     assert result is False
 
     # Test generic Exception
-    mock_socket.side_effect = Exception("Unexpected error")
+    mock_connect.side_effect = Exception("Unexpected error")
     result = scan_tcp_port("127.0.0.1", 80)
     assert result is False
 
     # Test successful case
-    mock_instance = MagicMock()
-    mock_instance.connect_ex.return_value = 0
-    mock_socket.return_value.__enter__.return_value = mock_instance
-    mock_socket.side_effect = None  # Reset side effect
+    mock_connect.side_effect = None
+    mock_connect.return_value.__enter__.return_value = MagicMock()
 
     result = scan_tcp_port("localhost", 80)
     assert result is True
 
     # Test closed port
-    mock_instance.connect_ex.return_value = 1  # Connection refused
+    mock_connect.side_effect = ConnectionRefusedError("Connection refused")
     result = scan_tcp_port("localhost", 81)
     assert result is False
 
-    # Test timeout (return code 110 on Linux)
-    mock_instance.connect_ex.return_value = 110
+    # Test timeout
+    mock_connect.side_effect = TimeoutError("Connection timed out")
     result = scan_tcp_port("localhost", 82)
     assert result is False
 
 
 @patch('scanner.core.scanner.validate_ip_address')
-@patch('scanner.core.scanner.socket.socket')
-def test_scan_ports_exceptions(mock_socket, mock_validate):
+@patch('scanner.core.scanner._connect')
+def test_scan_ports_exceptions(mock_connect, mock_validate):
     """Test exception handling in scan_ports."""
     # Setup validation mock
     mock_validate.return_value = "127.0.0.1"
@@ -174,25 +178,21 @@ def test_scan_ports_exceptions(mock_socket, mock_validate):
     mock_validate.return_value = "127.0.0.1"
 
     # Test socket exceptions during scanning
-    mock_instance = MagicMock()
-    mock_instance.connect_ex.side_effect = socket.error("Network error")
-    mock_socket.return_value.__enter__.return_value = mock_instance
+    mock_connect.side_effect = socket.error("Network error")
 
     # Should handle the error gracefully and return empty list
     result = scan_ports("localhost", [80, 443], max_threads=2)
     assert result == []  # No ports should be open due to errors
 
     # Test mixed success and failure
-    def connect_ex_side_effect(address):
-        host, port = address
+    def connect_side_effect(host, port, timeout):
         if port == 80:
-            return 0  # Open
-        elif port == 81:
+            return MagicMock()
+        if port == 81:
             raise socket.error("Network error")  # Error
-        else:
-            return 1  # Closed
+        raise ConnectionRefusedError("Connection refused")
 
-    mock_instance.connect_ex.side_effect = connect_ex_side_effect
+    mock_connect.side_effect = connect_side_effect
     result = scan_ports("localhost", [80, 81, 82], max_threads=3)
     assert result == [80]  # Only port 80 should be open
 

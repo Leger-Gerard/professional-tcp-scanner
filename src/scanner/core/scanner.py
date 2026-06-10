@@ -1,13 +1,20 @@
 """
 Core TCP port scanning functionality.
 """
-import socket
 import ipaddress
 import logging
-from typing import List, Set, Optional, Tuple, Union
+import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+MIN_PORT = 1
+MAX_PORT = 65535
+MIN_TIMEOUT = 0.1
+MAX_TIMEOUT = 30.0
+MIN_THREADS = 1
+MAX_THREADS = 1000
 
 
 def validate_ip_address(host: str) -> str:
@@ -23,6 +30,8 @@ def validate_ip_address(host: str) -> str:
     Raises:
         ValueError: If host is invalid
     """
+    host = host.strip()
+
     try:
         # Try to parse as IP address first
         ipaddress.ip_address(host)
@@ -40,7 +49,44 @@ def validate_ip_address(host: str) -> str:
         # At least one alphanumeric character
         if not any(c.isalnum() for c in host):
             raise ValueError(f"Invalid hostname format: {host}")
+        labels = host.split(".")
+        if any(len(label) > 63 for label in labels):
+            raise ValueError(f"Invalid hostname format: {host}")
+        if any(label.startswith("-") or label.endswith("-") for label in labels):
+            raise ValueError(f"Invalid hostname format: {host}")
         return host
+
+
+def validate_port(port: int) -> int:
+    """Validate a single TCP port number."""
+    if not isinstance(port, int) or isinstance(port, bool):
+        raise ValueError(f"Invalid port number: {port}")
+    if not (MIN_PORT <= port <= MAX_PORT):
+        raise ValueError(f"Port must be between {MIN_PORT}-{MAX_PORT}: {port}")
+    return port
+
+
+def validate_timeout(timeout: float) -> float:
+    """Validate connection timeout bounds."""
+    if timeout < MIN_TIMEOUT or timeout > MAX_TIMEOUT:
+        raise ValueError(f"Timeout must be between {MIN_TIMEOUT} and {MAX_TIMEOUT} seconds")
+    return timeout
+
+
+def validate_max_threads(max_threads: int) -> int:
+    """Validate scanner concurrency bounds."""
+    if not isinstance(max_threads, int) or isinstance(max_threads, bool):
+        raise ValueError(f"Threads must be an integer between {MIN_THREADS} and {MAX_THREADS}")
+    if max_threads < MIN_THREADS or max_threads > MAX_THREADS:
+        raise ValueError(f"Threads must be between {MIN_THREADS} and {MAX_THREADS}")
+    return max_threads
+
+
+def validate_ports(ports: List[int]) -> List[int]:
+    """Validate and sort a collection of TCP ports."""
+    if not ports:
+        return []
+    return sorted({validate_port(port) for port in ports})
 
 
 def parse_ports(port_string: str) -> List[int]:
@@ -85,8 +131,8 @@ def parse_ports(port_string: str) -> List[int]:
                 start_port = int(start_str.strip())
                 end_port = int(end_str.strip())
 
-                if not (1 <= start_port <= 65535) or not (1 <= end_port <= 65535):
-                    raise ValueError(f"Ports must be between 1-65535: {part}")
+                validate_port(start_port)
+                validate_port(end_port)
 
                 if start_port > end_port:
                     raise ValueError(f"Start port must be <= end port: {part}")
@@ -105,16 +151,17 @@ def parse_ports(port_string: str) -> List[int]:
             except ValueError:
                 raise ValueError(f"Invalid port number: {part}")
 
-            # Validate port range after successful conversion
-            if not (1 <= port <= 65535):
-                raise ValueError(f"Port must be between 1-65535: {part}")
-
-            ports.add(port)
+            ports.add(validate_port(port))
 
     if not ports:
         raise ValueError("No valid ports specified")
 
     return sorted(list(ports))
+
+
+def _connect(host: str, port: int, timeout: float) -> socket.socket:
+    """Open an IPv4 or IPv6 TCP connection with a bounded timeout."""
+    return socket.create_connection((host, port), timeout=timeout)
 
 
 def scan_tcp_port(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -129,18 +176,18 @@ def scan_tcp_port(host: str, port: int, timeout: float = 0.5) -> bool:
     Returns:
         True if port is open, False otherwise
     """
+    validate_port(port)
+    validate_timeout(timeout)
+
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            result = sock.connect_ex((host, port))
-            is_open = result == 0
-            logger.debug(f"Port {port} on {host}: {'OPEN' if is_open else 'CLOSED'} (result={result})")
-            return is_open
+        with _connect(host, port, timeout):
+            logger.debug("Port %s on %s: OPEN", port, host)
+            return True
     except socket.gaierror as e:
         logger.warning(f"DNS resolution failed for {host}: {e}")
         return False
-    except socket.error as e:
-        logger.debug(f"Socket error scanning port {port} on {host}: {e}")
+    except (ConnectionRefusedError, TimeoutError, OSError) as e:
+        logger.debug("Port %s on %s: CLOSED/FILTERED (%s)", port, host, e)
         return False
     except Exception as e:
         logger.error(f"Unexpected error scanning port {port} on {host}: {e}")
@@ -160,27 +207,24 @@ def scan_tcp_port_with_banner(host: str, port: int, timeout: float = 0.5) -> Tup
         Tuple of (is_open, banner_data) where banner_data is None if no banner
         could be retrieved or if port is closed
     """
-    banner = None
-    is_open = False
+    validate_port(port)
+    validate_timeout(timeout)
 
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            result = sock.connect_ex((host, port))
-            is_open = result == 0
-
-            if is_open:
-                # Connection successful, attempt banner grab
-                banner = _grab_banner(sock, port, timeout)
-
-            logger.debug(f"Port {port} on {host}: {'OPEN' if is_open else 'CLOSED'} "
-                        f"{'- Banner: ' + str(banner)[:50] if banner else ''}")
-            return is_open, banner
+        with _connect(host, port, timeout) as sock:
+            banner = _grab_banner(sock, port, timeout)
+            logger.debug(
+                "Port %s on %s: OPEN%s",
+                port,
+                host,
+                f" - Banner: {banner[:50]}" if banner else "",
+            )
+            return True, banner
     except socket.gaierror as e:
         logger.warning(f"DNS resolution failed for {host}: {e}")
         return False, None
-    except socket.error as e:
-        logger.debug(f"Socket error scanning port {port} on {host}: {e}")
+    except (ConnectionRefusedError, TimeoutError, OSError) as e:
+        logger.debug("Port %s on %s: CLOSED/FILTERED (%s)", port, host, e)
         return False, None
     except Exception as e:
         logger.error(f"Unexpected error scanning port {port} on {host}: {e}")
@@ -215,9 +259,6 @@ def _grab_banner(sock: socket.socket, port: int, timeout: float) -> Optional[str
     Returns:
         Banner string if retrieved, None otherwise
     """
-    if not sock:
-        return None
-
     banner_data = b""
 
     try:
@@ -237,14 +278,14 @@ def _grab_banner(sock: socket.socket, port: int, timeout: float) -> Optional[str
             # Send protocol-specific probes if needed
             if port in [80, 8080, 8000, 8888, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089]:  # HTTP variants
                 try:
-                    sock.send(b"GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: Mozilla/5.0\r\n\r\n")
+                    sock.sendall(
+                        b"HEAD / HTTP/1.1\r\n"
+                        b"Host: localhost\r\n"
+                        b"User-Agent: port-scanner/1.0\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
                 except OSError:
                     pass  # Ignore send errors
-            elif port == 443 or port == 8443:  # HTTPS (basic attempt without SSL)
-                try:
-                    sock.send(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-                except OSError:
-                    pass
             elif port == 21:  # FTP
                 # FTP usually sends banner immediately, already captured above
                 pass
@@ -268,7 +309,7 @@ def _grab_banner(sock: socket.socket, port: int, timeout: float) -> Optional[str
                 pass
             elif port == 6379:  # Redis
                 try:
-                    sock.send(b"INFO\r\n")
+                    sock.sendall(b"INFO\r\n")
                 except OSError:
                     pass
             elif port == 27017:  # MongoDB
@@ -319,17 +360,20 @@ def scan_ports(
 
     # Validate host
     validated_host = validate_ip_address(host)
+    validated_ports = validate_ports(ports)
+    validate_timeout(timeout)
+    validate_max_threads(max_threads)
     logger.info(f"Starting scan of {validated_host} on {len(ports)} ports "
                 f"(timeout={timeout}s, max_threads={max_threads})")
 
     open_ports: List[int] = []
 
     # Use ThreadPoolExecutor for controlled concurrency
-    with ThreadPoolExecutor(max_workers=min(max_threads, len(ports))) as executor:
+    with ThreadPoolExecutor(max_workers=min(max_threads, len(validated_ports))) as executor:
         # Submit all scan tasks
         future_to_port = {
             executor.submit(scan_tcp_port, validated_host, port, timeout): port
-            for port in ports
+            for port in validated_ports
         }
 
         # Process results as they complete
@@ -370,6 +414,9 @@ def scan_ports_with_banner(
 
     # Validate host
     validated_host = validate_ip_address(host)
+    validated_ports = validate_ports(ports)
+    validate_timeout(timeout)
+    validate_max_threads(max_threads)
     logger.info(f"Starting banner grab scan of {validated_host} on {len(ports)} ports "
                 f"(timeout={timeout}s, max_threads={max_threads})")
 
@@ -379,11 +426,11 @@ def scan_ports_with_banner(
     from scanner.services.service_detector import get_service_name
 
     # Use ThreadPoolExecutor for controlled concurrency
-    with ThreadPoolExecutor(max_workers=min(max_threads, len(ports))) as executor:
+    with ThreadPoolExecutor(max_workers=min(max_threads, len(validated_ports))) as executor:
         # Submit all scan tasks with banner grabbing
         future_to_port = {
             executor.submit(scan_tcp_port_with_banner, validated_host, port, timeout): port
-            for port in ports
+            for port in validated_ports
         }
 
         # Process results as they complete

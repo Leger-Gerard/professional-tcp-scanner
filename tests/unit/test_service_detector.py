@@ -2,9 +2,7 @@
 Unit tests for service detector module.
 """
 import logging
-from unittest.mock import patch
 
-import pytest
 
 from scanner.services.service_detector import ServiceDetector, get_service_name
 

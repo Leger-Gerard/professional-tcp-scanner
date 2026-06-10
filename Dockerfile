@@ -1,28 +1,29 @@
-# Use official Python slim image for security and size
-FROM python:3.13-slim
+FROM python:3.13-slim AS builder
 
-# Set working directory
+# Avoid bytecode writes and keep output unbuffered in containers
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# Install system dependencies (minimal)
-RUN apt-get update && apt-get install -y \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy project files
 COPY pyproject.toml README.md ./
 COPY src/ ./src/
-COPY tests/ ./tests/
 
-# Install package in development mode (includes dependencies)
-RUN pip install --no-cache-dir -e .
+RUN python -m pip install --upgrade pip \
+    && python -m pip wheel --no-cache-dir --wheel-dir /wheels .
 
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash appuser
+FROM python:3.13-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY --from=builder /wheels /wheels
+RUN python -m pip install --no-cache-dir /wheels/*.whl \
+    && rm -rf /wheels
+
+RUN useradd --create-home --shell /usr/sbin/nologin appuser
 USER appuser
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-
-# Default command
 ENTRYPOINT ["port-scanner"]

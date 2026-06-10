@@ -1,472 +1,492 @@
-"""
-Professional CLI interface for TCP port scanner using Typer and Rich.
-"""
-import json
+"""Professional CLI interface for the TCP port scanner."""
+
 import logging
-import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Literal, Optional, cast
 
 import typer
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-from rich.table import Table
-from rich.text import Text
-from rich.panel import Panel
 from rich.logging import RichHandler
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.table import Table
 
 from scanner.core.scanner import (
-    scan_ports,
-    validate_ip_address,
     parse_ports,
     scan_tcp_port,
-    scan_tcp_port_with_banner
+    scan_tcp_port_with_banner,
+    validate_ip_address,
+    validate_max_threads,
+    validate_timeout,
 )
+from scanner.engines import BannerResult, ScanResults, ThreadedScanEngine
+from scanner.models import PortFinding, ScanReport, score_port_risk
+from scanner.policies import ScanProfileName, get_policy
+from scanner.reporting import serialize_report
+from scanner.security import inspect_tls_certificate, reverse_dns_lookup
 from scanner.services.service_detector import get_service_name
 
-# Initialize console and app
 console = Console()
+
 app = typer.Typer(
     name="port-scanner",
     help="Professional TCP port scanner for security assessments",
     add_completion=False,
-    rich_markup_mode="rich"
+    rich_markup_mode="rich",
 )
 
-# Setup logging
-def setup_logging(verbose: bool = False, log_file: Optional[Path] = None) -> None:
-    """Setup logging configuration."""
-    log_level = logging.DEBUG if verbose else logging.INFO
 
-    # Configure root logger
+ReportFormat = Literal["table", "json", "csv", "markdown", "html"]
+
+logger = logging.getLogger(__name__)
+
+
+class _NoopProgress:
+    """Progress-compatible object for machine-readable output paths."""
+
+    def update(self, task_id: TaskID, advance: int = 1) -> None:
+        return None
+
+
+def validate_timeout_option(value: float) -> float:
+    """Validate timeout CLI option."""
+    try:
+        return validate_timeout(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def validate_threads_option(value: int) -> int:
+    """Validate threads CLI option."""
+    try:
+        return validate_max_threads(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def validate_report_format(value: str) -> ReportFormat:
+    """Validate report format CLI option."""
+    allowed = {"table", "json", "csv", "markdown", "html"}
+    if value not in allowed:
+        raise typer.BadParameter(f"Format must be one of: {', '.join(sorted(allowed))}")
+    return cast(ReportFormat, value)
+
+
+def setup_logging(
+    verbose: bool = False,
+    log_file: Optional[Path] = None,
+    quiet_console: bool = False,
+) -> None:
+    """Configure application logging."""
+    level = logging.DEBUG if verbose else logging.INFO
+    handlers: list[logging.Handler] = []
+
+    if not quiet_console:
+        handlers.append(RichHandler(console=Console(stderr=True), rich_tracebacks=True))
+
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+
     logging.basicConfig(
-        level=log_level,
+        level=level,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            RichHandler(console=console, rich_tracebacks=True),
-            logging.FileHandler(log_file) if log_file else logging.NullHandler()
-        ]
+        handlers=handlers,
+        force=True,
     )
 
 
 @app.command()
 def scan(
-    host: str = typer.Option(
-        ...,
-        "--host",
-        "-h",
-        help="Target host to scan (IP address or hostname)",
-        prompt=True
-    ),
-    ports: str = typer.Option(
-        "1-1024",
-        "--ports",
-        "-p",
-        help="Port range to scan (e.g., '80,443' or '1-1000' or '80,443,8000-9000')"
-    ),
+    host: str = typer.Option(..., "--host", "-h", help="Target host or IP address"),
+    ports: str = typer.Option("1-1024", "--ports", "-p", help="Ports to scan"),
     timeout: float = typer.Option(
         0.5,
         "--timeout",
         "-t",
+        callback=validate_timeout_option,
         help="Connection timeout in seconds",
-        min=0.1,
-        max=30.0
     ),
     threads: int = typer.Option(
         100,
         "--threads",
-        "-T",
-        help="Maximum number of concurrent threads",
-        min=1,
-        max=1000
+        callback=validate_threads_option,
+        help="Maximum concurrent threads",
     ),
     json_output: bool = typer.Option(
         False,
         "--json-output",
         "-j",
-        help="Output results in JSON format"
+        help="Output JSON (legacy alias for --format json)",
+    ),
+    output_format: ReportFormat = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        callback=validate_report_format,
+        help="Output format: table, json, csv, markdown, html",
     ),
     output: Optional[Path] = typer.Option(
         None,
         "--output",
         "-o",
-        help="Output file path for JSON report (requires --json-output)"
+        help="Output file for json, csv, markdown, or html reports",
     ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable verbose logging"
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logs"),
+    stealth: bool = typer.Option(False, "--stealth", help="Enable stealth mode"),
+    profile: ScanProfileName = typer.Option(
+        "normal",
+        "--profile",
+        help="Scan policy profile: safe, normal, aggressive",
     ),
-    stealth: bool = typer.Option(
-        False,
-        "--stealth",
-        "-s",
-        help="Use slower scan timing to reduce detection likelihood"
-    ),
-    banner: bool = typer.Option(
-        True,
-        "--banner/--no-banner",
-        help="Show or hide banner"
-    ),
+    banner: bool = typer.Option(True, "--banner/--no-banner", help="Show CLI banner"),
     banner_grab: bool = typer.Option(
         False,
         "--banner-grab",
         "-b",
-        help="Attempt to grab service banners from open ports"
-    )
+        help="Attempt to grab service banners from open ports",
+    ),
+    tls_inspect: bool = typer.Option(
+        False,
+        "--tls-inspect",
+        help="Inspect TLS certificates on common TLS ports",
+    ),
+    reverse_dns: bool = typer.Option(
+        False,
+        "--reverse-dns",
+        help="Resolve reverse DNS for IP targets",
+    ),
 ) -> None:
-    """
-    Scan TCP ports on a target host.
+    """Scan TCP ports on a target host."""
+    if json_output:
+        output_format = "json"
 
-    Examples:
-
-    # Scan common ports on localhost
-    port-scanner scan --host 127.0.0.1
-
-    # Scan specific ports with custom timeout
-    port-scanner scan --host example.com --ports 80,443,8080 --timeout 1.0
-
-    # Full port scan with JSON output
-    port-scanner scan --host 192.168.1.1 --ports 1-65535 --json-output --output results.json
-
-    # Stealth scan for security assessments
-    port-scanner scan --host target.com --stealth --threads 50
-
-    # Scan with banner grabbing for service fingerprinting
-    port-scanner scan --host target.com --ports 80,443,22 --banner-grab
-    """
-    # Adjust timing for stealth mode
-    if stealth:
-        timeout = max(timeout, 2.0)  # Minimum 2s timeout for stealth
-        threads = min(threads, 50)   # Max 50 threads for stealth
-
-    # Setup logging
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / "scan.log"
-    setup_logging(verbose, log_file)
-
-    logger = logging.getLogger(__name__)
+    machine_output = output_format != "table"
+    setup_logging(verbose, quiet_console=machine_output and not verbose)
+    scan_logger = logging.getLogger(__name__)
 
     try:
-        # Validate inputs
-        validated_host = validate_ip_address(host)
-        port_list = parse_ports(ports)
-
-        # Show banner
-        if banner:
+        if banner and not machine_output:
             show_banner()
 
-        # Display scan info
-        console.print(f"\n[bold blue]Target:[/bold blue] {validated_host}")
-        console.print(f"[bold blue]Ports:[/bold blue] {len(port_list)} ports")
-        console.print(f"[bold blue]Timeout:[/bold blue] {timeout}s")
-        console.print(f"[bold blue]Threads:[/bold blue] {threads}")
+        policy = get_policy(profile)
         if stealth:
-            console.print("[yellow]Stealth mode enabled[/yellow]")
-        console.print()
+            timeout = max(timeout, 1.0)
+            threads = min(threads, 50)
+            if not machine_output:
+                console.print("[yellow]Stealth mode enabled[/yellow]")
 
-        # Perform scan with progress bar
-        start_time = datetime.now()
+        validated_host = validate_ip_address(host)
+        port_list = parse_ports(ports)
+        port_list, timeout, threads = policy.apply(port_list, timeout, threads)
+        banner_grab = banner_grab or policy.banner_grab
+        tls_inspect = tls_inspect or policy.tls_inspection
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True
-        ) as progress:
+        if not machine_output:
+            console.print(f"\nTarget: [cyan]{validated_host}[/cyan]")
+            console.print(f"Ports: [cyan]{len(port_list)} ports[/cyan]")
+            console.print(f"Timeout: [cyan]{timeout}s[/cyan]")
+            console.print(f"Threads: [cyan]{threads}[/cyan]")
+            console.print(f"Profile: [cyan]{policy.name}[/cyan]\n")
 
-            task = progress.add_task(
-                f"Scanning {validated_host}...",
-                total=len(port_list)
-            )
-
-            # Custom scan function with progress updates
-            scan_results = _scan_with_progress(
+        started_at = datetime.now()
+        if machine_output:
+            scan_results = _scan_without_progress(
                 validated_host,
                 port_list,
                 timeout,
                 threads,
-                progress,
-                task,
-                grab_banner=banner_grab
+                grab_banner=banner_grab,
             )
+        else:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Scanning ports...", total=len(port_list))
+                scan_results = _scan_with_progress(
+                    validated_host,
+                    port_list,
+                    timeout,
+                    threads,
+                    progress,
+                    task,
+                    grab_banner=banner_grab,
+                )
 
-        end_time = datetime.now()
-        scan_duration = (end_time - start_time).total_seconds()
-
-        # Display results
-        _display_results(
+        duration = (datetime.now() - started_at).total_seconds()
+        report = _build_scan_report(
             validated_host,
             scan_results,
-            scan_duration,
-            json_output,
+            started_at,
+            duration,
             len(port_list),
-            output,
-            banner_grab=banner_grab
+            profile=policy.name,
+            banner_grab=banner_grab,
+            tls_inspection=tls_inspect,
+            reverse_dns=reverse_dns,
+            timeout=timeout,
         )
 
-        # Log results
-        open_ports_count = len(scan_results) if isinstance(scan_results, list) else 0
-        logger.info(f"Scan completed: {open_ports_count} open ports found in {scan_duration:.2f}s")
+        _display_results(report, output_format, output)
+
+        scan_logger.info(
+            "Scan completed: %s open ports found in %.2fs",
+            report.open_ports_count,
+            duration,
+        )
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Scan interrupted by user[/yellow]")
-        raise typer.Exit(1)
-    except Exception as e:
-        logger.error(f"Scan failed: {e}")
-        console.print(f"[bold red]Error:[/bold red] {e}")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from None
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        scan_logger.error("Scan failed: %s", exc)
+        console.print(f"[bold red]Error:[/bold red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+def _scan_without_progress(
+    host: str,
+    ports: list[int],
+    timeout: float,
+    max_threads: int,
+    grab_banner: bool = False,
+) -> ScanResults:
+    """Scan ports without terminal progress output."""
+    return _scan_with_progress(
+        host,
+        ports,
+        timeout,
+        max_threads,
+        cast(Progress, _NoopProgress()),
+        cast(TaskID, 0),
+        grab_banner=grab_banner,
+    )
 
 
 def _scan_with_progress(
     host: str,
-    ports: List[int],
+    ports: list[int],
     timeout: float,
     max_threads: int,
     progress: Progress,
-    task_id,
-    grab_banner: bool = False
-) -> Union[List[int], List[dict]]:
-    """
-    Scan ports with progress bar updates.
+    task_id: TaskID,
+    grab_banner: bool = False,
+) -> ScanResults:
+    """Scan ports with progress updates."""
+    engine = ThreadedScanEngine(
+        scan_port=scan_tcp_port,
+        scan_port_with_banner=scan_tcp_port_with_banner,
+    )
+    return engine.scan(
+        host,
+        ports,
+        timeout,
+        max_threads,
+        grab_banner=grab_banner,
+        progress_callback=lambda _port: progress.update(task_id, advance=1),
+    )
 
-    Args:
-        host: Target host
-        ports: Ports to scan
-        timeout: Connection timeout
-        max_threads: Max concurrent threads
-        progress: Rich progress instance
-        task_id: Progress task ID
-        grab_banner: Whether to attempt banner grabbing
 
-    Returns:
-        If grab_banner=False: List[int] (open ports)
-        If grab_banner=True: List[dict] with keys: port, status, service, banner
-    """
-    if not ports:
-        return [] if not grab_banner else []
-
-    # Import service detector for service names
-    from scanner.services.service_detector import get_service_name
-
-    # Use ThreadPoolExecutor for controlled concurrency
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    results: Union[List[int], List[dict]] = []
-
-    with ThreadPoolExecutor(max_workers=min(max_threads, len(ports))) as executor:
-        # Submit all scan tasks
-        future_to_port = {
-            executor.submit(
-                scan_tcp_port_with_banner if grab_banner else scan_tcp_port,
-                host,
+def _build_scan_report(
+    host: str,
+    scan_results: ScanResults,
+    started_at: datetime,
+    duration: float,
+    total_ports: int,
+    profile: str,
+    banner_grab: bool,
+    tls_inspection: bool,
+    reverse_dns: bool,
+    timeout: float,
+) -> ScanReport:
+    """Convert raw scan results into a typed report."""
+    findings: list[PortFinding] = []
+    if banner_grab:
+        banner_results = cast(list[BannerResult], scan_results)
+        for item in banner_results:
+            port = item["port"]
+            tls_certificate = (
+                inspect_tls_certificate(host, port, timeout) if tls_inspection else None
+            )
+            tls_detected = tls_certificate is not None
+            risk, risk_score, notes = score_port_risk(
                 port,
-                timeout
-            ): port
-            for port in ports
-        }
-
-        # Process results as they complete
-        for future in as_completed(future_to_port):
-            port = future_to_port[future]
-            try:
-                result = future.result()
-                if grab_banner:
-                    is_open, banner = result
-                    if is_open:
-                        service = get_service_name(port)
-                        # For consistency with the JSON output, we'll return a dict
-                        # that matches what scan_ports_with_banner returns
-                        results.append({
-                            "port": port,
-                            "status": "open",
-                            "service": service or "unknown",
-                            "banner": banner or ""
-                        })
-                        logger = logging.getLogger(__name__)
-                        logger.debug(f"Port {port} is OPEN on {host} - Service: {service or 'unknown'}")
-                    else:
-                        logger = logging.getLogger(__name__)
-                        logger.debug(f"Port {port} is CLOSED on {host}")
-                else:
-                    if result:  # port is open
-                        results.append(port)  # type: ignore
-                        logger = logging.getLogger(__name__)
-                        logger.debug(f"Port {port} is OPEN on {host}")
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.error(f"Error scanning port {port}: {e}")
-            finally:
-                progress.update(task_id, advance=1)
-
-    if grab_banner:
-        # Sort by port number
-        return sorted(results, key=lambda x: x["port"])  # type: ignore
+                item["service"],
+                item["banner"],
+                tls=tls_detected,
+            )
+            findings.append(
+                PortFinding(
+                    port=port,
+                    status=item["status"],
+                    service=item["service"],
+                    banner=item["banner"],
+                    tls=tls_detected,
+                    tls_certificate=tls_certificate,
+                    risk=risk,
+                    risk_score=risk_score,
+                    notes=notes,
+                )
+            )
     else:
-        return sorted(results)  # type: ignore
+        open_ports = cast(list[int], scan_results)
+        for port in open_ports:
+            service = get_service_name(port) or "unknown"
+            tls_certificate = (
+                inspect_tls_certificate(host, port, timeout) if tls_inspection else None
+            )
+            tls_detected = tls_certificate is not None
+            risk, risk_score, notes = score_port_risk(port, service, tls=tls_detected)
+            findings.append(
+                PortFinding(
+                    port=port,
+                    status="open",
+                    service=service,
+                    tls=tls_detected,
+                    tls_certificate=tls_certificate,
+                    risk=risk,
+                    risk_score=risk_score,
+                    notes=notes,
+                )
+            )
+
+    return ScanReport(
+        target=host,
+        started_at=started_at,
+        duration_seconds=duration,
+        total_ports_scanned=total_ports,
+        findings=sorted(findings, key=lambda finding: finding.port),
+        profile=profile,
+        reverse_dns=reverse_dns_lookup(host) if reverse_dns else None,
+        banner_grab_enabled=banner_grab,
+        tls_inspection_enabled=tls_inspection,
+    )
 
 
 def _display_results(
-    host: str,
-    scan_results: Union[List[int], List[dict]],
-    duration: float,
-    json_output: bool,
-    total_ports: int,
+    report: ScanReport,
+    output_format: ReportFormat,
     output: Optional[Path] = None,
-    banner_grab: bool = False
 ) -> None:
-    """
-    Display scan results.
-
-    Args:
-        host: Target host
-        scan_results: Either List[int] (open ports) or List[dict] (with service/banner info)
-        duration: Scan duration in seconds
-        json_output: Whether to output JSON
-        total_ports: Total number of ports scanned
-        output: Optional file path to write JSON report
-        banner_grab: Whether banner grabbing was performed
-    """
-    if json_output:
-        # JSON output
-        if banner_grab and isinstance(scan_results, list) and len(scan_results) > 0 and isinstance(scan_results[0], dict):
-            # Banner grabbing results format
-            result = {
-                "target": host,
-                "timestamp": datetime.now().isoformat(),
-                "scan_duration_seconds": round(duration, 2),
-                "total_ports_scanned": total_ports,
-                "open_ports": scan_results,
-                "open_ports_count": len(scan_results),
-                "banner_grab_enabled": True
-            }
-        else:
-            # Standard format
-            ports_with_services = []
-            for port in scan_results:  # type: ignore
-                ports_with_services.append({
-                    "port": port,
-                    "service": get_service_name(port) or "unknown"
-                })
-
-            result = {
-                "target": host,
-                "timestamp": datetime.now().isoformat(),
-                "scan_duration_seconds": round(duration, 2),
-                "total_ports_scanned": total_ports,
-                "open_ports": ports_with_services,
-                "open_ports_count": len(ports_with_services),
-                "banner_grab_enabled": banner_grab
-            }
-        json_str = json.dumps(result, indent=2)
-        if output:
-            # Ensure output directory exists
-            output.parent.mkdir(parents=True, exist_ok=True)
+    """Display or write scan results."""
+    if output_format != "table":
+        report_text = serialize_report(report, output_format)
+        if output is not None:
             try:
-                output.write_text(json_str)
-                logger = logging.getLogger(__name__)
-                logger.info(f"JSON report written to {output}")
-            except Exception as e:
-                logger = logging.getLogger(__name__)
-                logger.error(f"Failed to write JSON report to {output}: {e}")
-                console.print(f"[bold red]Error:[/bold red] Failed to write JSON report: {e}")
-                raise typer.Exit(1)
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(report_text, encoding="utf-8")
+                logger.info("%s report written to %s", output_format, output)
+            except OSError as exc:
+                message = f"Failed to write JSON report: {exc}" if output_format == "json" else f"Failed to write report: {exc}"
+                logger.error(message)
+                console.print(f"[bold red]Error:[/bold red] {message}")
+                raise typer.Exit(1) from exc
         else:
-            console.print(json_str)
+            console.print(report_text)
+        return
+
+    console.print()
+    if not report.findings:
+        console.print(f"[yellow]No open ports found on {report.target}[/yellow]")
     else:
-        # Rich formatted output
-        console.print()
+        table = Table(title=f"Open Ports on {report.target}")
+        table.add_column("Port", style="cyan", no_wrap=True)
+        table.add_column("Status", style="green")
+        table.add_column("Service", style="yellow")
+        table.add_column("Risk", style="red")
+        table.add_column("Score", justify="right")
+        table.add_column("Banner", style="dim", max_width=60)
 
-        if banner_grab and isinstance(scan_results, list) and len(scan_results) > 0 and isinstance(scan_results[0], dict):
-            # Banner grabbing results format
-            if scan_results:
-                # Create results table
-                table = Table(title=f"Open Ports on {host}")
-                table.add_column("Port", style="cyan", no_wrap=True)
-                table.add_column("Status", style="green")
-                table.add_column("Service", style="yellow")
-                table.add_column("Banner", style="dim", max_width=40)
+        for finding in report.findings:
+            banner_text = finding.banner or "[no banner]"
+            if len(banner_text) > 60:
+                banner_text = banner_text[:57] + "..."
+            table.add_row(
+                str(finding.port),
+                finding.status.upper(),
+                finding.service,
+                finding.risk.upper(),
+                str(finding.risk_score),
+                banner_text,
+            )
+        console.print(table)
 
-                for port_info in scan_results:
-                    banner_display = port_info["banner"][:50] + "..." if len(port_info["banner"]) > 50 else port_info["banner"]
-                    if not banner_display:
-                        banner_display = "[no banner]"
-                    table.add_row(
-                        str(port_info["port"]),
-                        port_info["status"],
-                        port_info["service"],
-                        banner_display
-                    )
-
-                console.print(table)
-            else:
-                console.print(f"[yellow]No open ports found on {host}[/yellow]")
-        else:
-            # Standard format
-            open_ports = scan_results if isinstance(scan_results, list) else []
-            if open_ports:
-                # Create results table
-                table = Table(title=f"Open Ports on {host}")
-                table.add_column("Port", style="cyan", no_wrap=True)
-                table.add_column("Status", style="green")
-                table.add_column("Service", style="yellow")
-
-                for port in open_ports:
-                    service = get_service_name(port)
-                    table.add_row(str(port), "OPEN", service)
-
-                console.print(table)
-            else:
-                console.print(f"[yellow]No open ports found on {host}[/yellow]")
-
-        # Summary panel
-        open_ports_count = len(scan_results) if isinstance(scan_results, list) else 0
-        summary_text = (
-            f"Target: {host}\n"
-            f"Duration: {duration:.2f} seconds\n"
-            f"Ports Scanned: {total_ports}\n"
-            f"Open Ports Found: {open_ports_count}"
-        )
-
-        panel = Panel(
-            summary_text,
-            title="Scan Summary",
-            border_style="blue"
-        )
-        console.print(panel)
-
-
-
-
-def show_banner() -> None:
-    """Display application banner."""
-    banner_text = """
-    ==============================
-      TCP Port Scanner v1.0.0
-    ==============================
-    """
-
-    banner_panel = Panel(
-        Text(banner_text, justify="center", style="bold blue"),
-        border_style="blue"
+    summary = (
+        f"Target: {report.target}\n"
+        f"Duration: {report.duration_seconds:.2f} seconds\n"
+        f"Ports Scanned: {report.total_ports_scanned}\n"
+        f"Open Ports Found: {report.open_ports_count}\n"
+        f"Highest Risk: {report.highest_risk.upper()}\n"
+        f"Reverse DNS: {report.reverse_dns or 'n/a'}"
     )
-    console.print(banner_panel)
-    console.print("[dim]Professional TCP Port Scanner for Security Assessments[/dim]\n")
+    console.print(Panel(summary, title="Scan Summary", border_style="blue"))
+
+
+def _build_json_report(
+    host: str,
+    scan_results: ScanResults,
+    duration: float,
+    total_ports: int,
+    banner_grab: bool,
+) -> dict[str, object]:
+    """Backward-compatible JSON report helper used by existing tests."""
+    report = _build_scan_report(
+        host=host,
+        scan_results=scan_results,
+        started_at=datetime.now(),
+        duration=duration,
+        total_ports=total_ports,
+        profile="normal",
+        banner_grab=banner_grab,
+        tls_inspection=False,
+        reverse_dns=False,
+        timeout=0.5,
+    )
+    data = report.to_dict()
+    if not banner_grab:
+        data["open_ports"] = [
+            {"port": finding.port, "service": finding.service}
+            for finding in report.findings
+        ]
+    return data
 
 
 @app.command()
 def version() -> None:
     """Show version information."""
     console.print("TCP Port Scanner v1.0.0")
-    console.print("Built with Python Typer and Rich")
+
+
+def show_banner() -> None:
+    """Display application banner."""
+    banner_text = """
+==============================
+     TCP Port Scanner v1.0.0
+==============================
+Professional TCP Port Scanner for Security Assessments
+"""
+    console.print(Panel(banner_text, border_style="blue"))
+
+
+def main() -> None:
+    """Application entry point."""
+    app()
 
 
 if __name__ == "__main__":
-    app()
+    main()

@@ -2,12 +2,25 @@
 Unit tests for CLI functionality.
 """
 import json
-import logging
-from unittest.mock import patch
+from datetime import datetime
+from unittest.mock import Mock, patch
+
 import pytest
+import typer
 from typer.testing import CliRunner
 
-from scanner.cli.main import app, show_banner
+from scanner.cli.main import (
+    _NoopProgress,
+    _build_json_report,
+    _build_scan_report,
+    _display_results,
+    _scan_with_progress,
+    app,
+    setup_logging,
+    show_banner,
+    validate_report_format,
+)
+from scanner.models import PortFinding, ScanReport, TlsCertificateInfo
 
 runner = CliRunner()
 
@@ -86,7 +99,9 @@ def test_scan_command_json_output(mock_scan_with_progress, mock_parse_ports, moc
     try:
         data = json.loads(json_str)
         assert data["target"] == "127.0.0.1"
-        assert data["open_ports"] == [{"port": 80, "service": "HTTP"}]
+        assert data["open_ports"][0]["port"] == 80
+        assert data["open_ports"][0]["service"] == "HTTP"
+        assert data["open_ports"][0]["risk"] == "medium"
         assert data["open_ports_count"] == 1
     except json.JSONDecodeError as e:
         pytest.fail(f"Output is not valid JSON: {json_str}. Error: {e}")
@@ -118,8 +133,58 @@ def test_scan_command_json_output_to_file(mock_scan_with_progress, mock_parse_po
     json_content = output_file.read_text()
     data = json.loads(json_content)
     assert data["target"] == "127.0.0.1"
-    assert data["open_ports"] == [{"port": 80, "service": "HTTP"}]
+    assert data["open_ports"][0]["port"] == 80
+    assert data["open_ports"][0]["service"] == "HTTP"
+    assert data["open_ports"][0]["risk"] == "medium"
     assert data["open_ports_count"] == 1
+
+
+@patch('scanner.cli.main.validate_ip_address')
+@patch('scanner.cli.main.parse_ports')
+@patch('scanner.cli.main._scan_with_progress')
+def test_scan_command_markdown_output(mock_scan_with_progress, mock_parse_ports, mock_validate_ip):
+    """Test scan command with Markdown output."""
+    mock_validate_ip.return_value = "127.0.0.1"
+    mock_parse_ports.return_value = [80]
+    mock_scan_with_progress.return_value = [80]
+
+    result = runner.invoke(app, [
+        "scan",
+        "--host", "localhost",
+        "--ports", "80",
+        "--format", "markdown",
+    ])
+
+    assert result.exit_code == 0
+    assert "# TCP Scan Report: 127.0.0.1" in result.stdout
+
+
+@patch('scanner.cli.main.validate_ip_address')
+@patch('scanner.cli.main.parse_ports')
+@patch('scanner.cli.main._scan_with_progress')
+def test_scan_command_csv_output_to_file(
+    mock_scan_with_progress,
+    mock_parse_ports,
+    mock_validate_ip,
+    tmp_path,
+):
+    """Test scan command with CSV output file."""
+    mock_validate_ip.return_value = "127.0.0.1"
+    mock_parse_ports.return_value = [80]
+    mock_scan_with_progress.return_value = [80]
+    output_file = tmp_path / "scan.csv"
+
+    result = runner.invoke(app, [
+        "scan",
+        "--host", "localhost",
+        "--ports", "80",
+        "--format", "csv",
+        "--output", str(output_file),
+    ])
+
+    assert result.exit_code == 0
+    assert output_file.exists()
+    assert "80,open,HTTP" in output_file.read_text()
 
 
 @patch('scanner.cli.main.validate_ip_address')
@@ -366,6 +431,169 @@ def test_show_banner():
         pytest.fail(f"show_banner() raised an exception: {e}")
 
 
+def test_validate_report_format_rejects_unknown_format():
+    with pytest.raises(Exception):
+        validate_report_format("xml")
+
+
+def test_setup_logging_with_file(tmp_path):
+    log_file = tmp_path / "scanner.log"
+
+    setup_logging(verbose=True, log_file=log_file, quiet_console=True)
+
+    assert log_file.parent.exists()
+
+
+def test_noop_progress_update():
+    progress = _NoopProgress()
+
+    assert progress.update(0, advance=1) is None
+
+
+@patch("scanner.cli.main.scan_tcp_port")
+def test_scan_with_progress_empty_and_exception_paths(mock_scan_tcp):
+    progress = Mock()
+
+    assert _scan_with_progress("localhost", [], 0.5, 1, progress, 1) == []
+
+    mock_scan_tcp.side_effect = [True, RuntimeError("boom")]
+    result = _scan_with_progress("localhost", [80, 81], 0.5, 2, progress, 1)
+
+    assert result == [80]
+    assert progress.update.call_count == 2
+
+
+@patch("scanner.cli.main.scan_tcp_port_with_banner")
+def test_scan_with_progress_banner_exception_paths(mock_scan_with_banner):
+    progress = Mock()
+    mock_scan_with_banner.side_effect = [
+        (True, "HTTP banner"),
+        RuntimeError("boom"),
+        (False, None),
+    ]
+
+    result = _scan_with_progress(
+        "localhost",
+        [80, 81, 82],
+        0.5,
+        3,
+        progress,
+        1,
+        grab_banner=True,
+    )
+
+    assert result == [
+        {
+            "port": 80,
+            "status": "open",
+            "service": "HTTP",
+            "banner": "HTTP banner",
+        }
+    ]
+    assert progress.update.call_count == 3
+
+
+@patch("scanner.cli.main.reverse_dns_lookup")
+@patch("scanner.cli.main.inspect_tls_certificate")
+def test_build_scan_report_with_banner_tls_and_reverse_dns(mock_tls, mock_reverse_dns):
+    mock_tls.return_value = TlsCertificateInfo(
+        subject="commonName=localhost",
+        issuer="commonName=Test CA",
+        not_before="Jan  1 00:00:00 2026 GMT",
+        not_after="Jan  1 00:00:00 2027 GMT",
+        serial_number="01",
+        san=["127.0.0.1"],
+    )
+    mock_reverse_dns.return_value = "localhost"
+
+    report = _build_scan_report(
+        "127.0.0.1",
+        [{"port": 443, "status": "open", "service": "HTTPS", "banner": "nginx"}],
+        datetime(2026, 1, 1, 12, 0, 0),
+        1.0,
+        1,
+        profile="normal",
+        banner_grab=True,
+        tls_inspection=True,
+        reverse_dns=True,
+        timeout=0.5,
+    )
+
+    assert report.reverse_dns == "localhost"
+    assert report.findings[0].tls is True
+    assert report.findings[0].service == "HTTPS"
+    mock_tls.assert_called_once_with("127.0.0.1", 443, 0.5)
+
+
+def test_build_json_report_banner_shape():
+    data = _build_json_report(
+        "127.0.0.1",
+        [{"port": 22, "status": "open", "service": "SSH", "banner": "OpenSSH"}],
+        1.0,
+        1,
+        banner_grab=True,
+    )
+
+    assert data["open_ports"][0]["banner"] == "OpenSSH"
+
+
+def test_display_results_table_no_findings(capsys):
+    report = ScanReport(
+        target="127.0.0.1",
+        started_at=datetime(2026, 1, 1, 12, 0, 0),
+        duration_seconds=0.1,
+        total_ports_scanned=1,
+        findings=[],
+        profile="normal",
+    )
+
+    _display_results(report, "table")
+
+    captured = capsys.readouterr()
+    assert "No open ports found" in captured.out
+
+
+def test_display_results_table_long_banner(capsys):
+    report = ScanReport(
+        target="127.0.0.1",
+        started_at=datetime(2026, 1, 1, 12, 0, 0),
+        duration_seconds=0.1,
+        total_ports_scanned=1,
+        findings=[
+            PortFinding(
+                port=80,
+                status="open",
+                service="HTTP",
+                banner="A" * 100,
+                risk="medium",
+                risk_score=50,
+            )
+        ],
+        profile="normal",
+    )
+
+    _display_results(report, "table")
+
+    captured = capsys.readouterr()
+    assert "HTTP" in captured.out
+
+
+@patch("pathlib.Path.write_text")
+def test_display_results_non_json_write_error(mock_write_text, tmp_path):
+    mock_write_text.side_effect = OSError("disk full")
+    report = ScanReport(
+        target="127.0.0.1",
+        started_at=datetime(2026, 1, 1, 12, 0, 0),
+        duration_seconds=0.1,
+        total_ports_scanned=1,
+        findings=[],
+        profile="normal",
+    )
+
+    with pytest.raises(typer.Exit):
+        _display_results(report, "markdown", tmp_path / "report.md")
+
+
 @patch('scanner.cli.main.logging.getLogger')
 @patch('scanner.cli.main.setup_logging')
 @patch('scanner.cli.main.validate_ip_address')
@@ -378,7 +606,7 @@ def test_scan_command_logging_setup(mock_scan_with_progress, mock_parse_ports, m
     mock_validate_ip.return_value = "127.0.0.1"
     mock_parse_ports.return_value = [80]
     mock_scan_with_progress.return_value = [80]
-    mock_logger = mock_get_logger.return_value
+
 
     result = runner.invoke(app, [
         "scan",
@@ -405,7 +633,7 @@ def test_scan_command_verbose_logging(mock_scan_with_progress, mock_parse_ports,
     mock_validate_ip.return_value = "127.0.0.1"
     mock_parse_ports.return_value = [80]
     mock_scan_with_progress.return_value = [80]
-    mock_logger = mock_get_logger.return_value
+
 
     result = runner.invoke(app, [
         "scan",
